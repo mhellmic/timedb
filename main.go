@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"syscall"
 	"time"
 )
 
@@ -27,6 +28,33 @@ type CommandInfo struct {
 	Resources interface{}
 }
 
+func printDuration(duration Duration) {
+	fmt.Printf("\t%.2f real\t%.2f user\t%.2f sys\n", duration.Wall.Seconds(), duration.User.Seconds(), duration.System.Seconds())
+}
+
+func run(args []string) (Duration, CommandInfo, error) {
+	duration := Duration{}
+	cmdInfo := CommandInfo{}
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	start := time.Now()
+	err := cmd.Start()
+	check(err)
+	err = cmd.Wait()
+	duration.Wall = time.Since(start)
+	duration.User = cmd.ProcessState.UserTime()
+	duration.System = cmd.ProcessState.SystemTime()
+	cmdInfo.Resources = cmd.ProcessState.SysUsage().(*syscall.Rusage)
+	if exiterr, ok := err.(*exec.ExitError); ok {
+		if status, ok := exiterr.Sys().(syscall.WaitStatus); ok {
+			cmdInfo.ExitCode = status.ExitStatus()
+		}
+	}
+	return duration, cmdInfo, err
+}
+
 func main() {
 	printVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
@@ -41,23 +69,10 @@ func main() {
 		fmt.Println("No command to measure given. Exiting ...")
 		return
 	}
-	duration := Duration{}
-	cmdInfo := CommandInfo{}
-	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	start := time.Now()
-	err := cmd.Run()
-	duration.Wall = time.Since(start)
-	duration.User = cmd.ProcessState.UserTime()
-	duration.System = cmd.ProcessState.SystemTime()
-	// GetUserSystemTimes(&duration)
+	duration, cmdInfo, err := run(cmdArgs)
 	if err != nil {
 		fmt.Println(err)
 	}
-	cmdInfo.ExitCode = 0
-	cmdInfo.Resources = cmd.ProcessState.SysUsage()
-	fmt.Printf("\t%v real\t%v user\t%v sys\n", duration.Wall.Seconds(), duration.User.Seconds(), duration.System.Seconds())
-	fmt.Println(cmdInfo.Resources)
+	printDuration(duration)
+	_ = cmdInfo
 }
