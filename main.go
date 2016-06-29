@@ -16,19 +16,6 @@ func check(e error) {
 	}
 }
 
-func startProcessWithSyscall() {
-	// var procAttr syscall.ProcAttr
-	// cwd, err := os.Getwd()
-	// check(err)
-	// procAttr := syscall.ProcAttr{
-	// 	Dir:   cwd,
-	// 	Env:   os.Environ(),
-	// 	Files: []uintptr{},
-	// }
-	// syscall.Exec(cmdArgs[0], cmdArgs, os.Environ())
-	// syscall.ForkExec(cmdArgs[0], cmdArgs, &procAttr)
-}
-
 type Duration struct {
 	Wall   time.Duration
 	User   time.Duration
