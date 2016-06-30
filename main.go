@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/syndtr/goleveldb/leveldb"
-	// "github.com/syndtr/goleveldb/leveldb/util"
+	"github.com/syndtr/goleveldb/leveldb/util"
 
 	"gopkg.in/vmihailenco/msgpack.v2"
 )
@@ -125,9 +125,87 @@ func printDb(dbfile string) (err error) {
 	iter := db.NewIterator(nil, nil)
 	for iter.Next() {
 		key := recoverDbKey(iter.Key())
+		_ = key
 		cmdInfo, err := recoverDbValue(iter.Value())
 		_ = err
-		fmt.Printf("%s\t= %s\n", key, parseDuration(cmdInfo))
+		fmt.Printf("%s\t%s\t= %s\n", cmdInfo.Start.In(time.Local).Format("2006-01-02 15:04:05"),
+			cmdInfo.Cmd, parseDuration(cmdInfo))
+	}
+	iter.Release()
+	err = iter.Error()
+
+	return
+}
+
+func parseTime(arg string) (time.Time, error) {
+	var err error
+	var formats = []string{
+		"2.1.2006_15:04",
+		"2.1.2006_15",
+		"2.1.2006",
+		"15:04",
+	}
+	for _, f := range formats {
+		t, err := time.ParseInLocation(f, arg, time.Local)
+		if err == nil {
+			if t.Year() == 0 {
+				now := time.Now()
+				t = t.AddDate(now.Year(), int(now.Month())-1, now.Day()-1)
+			}
+			return t, err
+		}
+	}
+	return time.Time{}, err
+}
+
+func parseStartEnd(args []string) (time.Time, time.Time) {
+	const format = "2.1.2006_15:04:05"
+	start := time.Time{}
+	end := time.Now()
+	var startErr error
+	var endErr error
+	for _, arg := range args {
+		ts := strings.SplitN(arg, "-", 2)
+		if len(ts) == 2 {
+			end, endErr = parseTime(ts[1])
+			start, startErr = parseTime(ts[0])
+			if startErr == nil || endErr == nil {
+				if endErr != nil {
+					end = time.Now()
+				}
+				return start, end
+			}
+		}
+		// a single time is interpreted as single day
+		start, startErr = parseTime(arg)
+		if startErr == nil {
+			end = start.Add(24 * time.Hour)
+			return start, end
+		}
+	}
+	return start, end
+}
+
+func searchDb(dbfile string, args []string) (err error) {
+	db, err := leveldb.OpenFile(dbfile, nil)
+	if err != nil {
+		return
+	}
+	defer db.Close()
+
+	start, end := parseStartEnd(args)
+
+	lowerBound := []byte(start.UTC().String())
+	upperBound := []byte(end.UTC().String())
+
+	iter := db.NewIterator(&util.Range{Start: lowerBound, Limit: upperBound}, nil)
+	for iter.Next() {
+		key := recoverDbKey(iter.Key())
+		_ = key
+		cmdInfo, err := recoverDbValue(iter.Value())
+		_ = err
+		fmt.Printf("%s\t%s\t= %s\n", cmdInfo.Start.In(time.Local).Format("2006-01-02 15:04:05"),
+			cmdInfo.Cmd, parseDuration(cmdInfo))
 	}
 	iter.Release()
 	err = iter.Error()
@@ -191,7 +269,7 @@ func main() {
 		return
 	}
 	if *search {
-		printDb(dbfile)
+		searchDb(dbfile, cmdArgs)
 		return
 	}
 	if len(cmdArgs) == 0 {
