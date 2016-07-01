@@ -162,6 +162,7 @@ func printDb(config Config) (err error) {
 
 func parseTime(arg string) (time.Time, error) {
 	var err error
+	var t time.Time
 	var formats = []string{
 		"2.1.2006_15:04",
 		"2.1.2006_15",
@@ -169,7 +170,7 @@ func parseTime(arg string) (time.Time, error) {
 		"15:04",
 	}
 	for _, f := range formats {
-		t, err := time.ParseInLocation(f, arg, time.Local)
+		t, err = time.ParseInLocation(f, arg, time.Local)
 		if err == nil {
 			if t.Year() == 0 {
 				now := time.Now()
@@ -184,13 +185,11 @@ func parseTime(arg string) (time.Time, error) {
 func parseStartEnd(args []string) (time.Time, time.Time, int) {
 	start := time.Time{}
 	end := time.Now()
-	var startErr error
-	var endErr error
 	for i, arg := range args {
 		ts := strings.SplitN(arg, "-", 2)
 		if len(ts) == 2 {
-			end, endErr = parseTime(ts[1])
-			start, startErr = parseTime(ts[0])
+			end, endErr := parseTime(ts[1])
+			start, startErr := parseTime(ts[0])
 			if startErr == nil || endErr == nil {
 				if endErr != nil {
 					end = time.Now()
@@ -199,13 +198,23 @@ func parseStartEnd(args []string) (time.Time, time.Time, int) {
 			}
 		}
 		// a single time is interpreted as single day
-		start, startErr = parseTime(arg)
+		start, startErr := parseTime(arg)
 		if startErr == nil {
 			end = start.Add(24 * time.Hour)
 			return start, end, i
 		}
 	}
-	return start, end, 0
+	return start, end, -1
+}
+
+func findInCmdKey(cmd string, keywords []string) bool {
+	allFound := true
+	for _, k := range keywords {
+		if found := strings.Contains(cmd, k); !found {
+			return false
+		}
+	}
+	return allFound
 }
 
 func searchDb(config Config, args []string) (err error) {
@@ -216,8 +225,16 @@ func searchDb(config Config, args []string) (err error) {
 	defer db.Close()
 
 	start, end, timeIdx := parseStartEnd(args)
-	keywords := args[timeIdx+1:]
-	_ = keywords
+	var keywords []string
+	if len(args) == 0 || timeIdx < 0 {
+		keywords = args
+	} else {
+		keywords = args[timeIdx+1:]
+	}
+	if config.Verbose {
+		fmt.Printf("search min: %v\nsearch max: %v\n", start, end)
+		fmt.Printf("keywords: %d %v\n", len(keywords), keywords)
+	}
 
 	lowerBound := []byte(start.UTC().String())
 	upperBound := []byte(end.UTC().String())
@@ -225,11 +242,13 @@ func searchDb(config Config, args []string) (err error) {
 	iter := db.NewIterator(&util.Range{Start: lowerBound, Limit: upperBound}, nil)
 	for iter.Next() {
 		start, cmd := recoverDbKey(iter.Key())
-		_, _ = start, cmd
-		cmdInfo, err := recoverDbValue(iter.Value())
-		_ = err
-		fmt.Printf("%s\t%s\t= %s\n", start.In(time.Local).Format("2006-01-02 15:04:05"),
-			cmd, parseDuration(cmdInfo))
+		_ = start
+		if findInCmdKey(cmd, keywords) {
+			cmdInfo, err := recoverDbValue(iter.Value())
+			check(err)
+			fmt.Printf("%s\t%s\t= %s\n", start.In(time.Local).Format("2006-01-02 15:04:05"),
+				cmd, parseDuration(cmdInfo))
+		}
 	}
 	iter.Release()
 	err = iter.Error()
