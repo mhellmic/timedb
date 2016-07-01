@@ -29,6 +29,11 @@ var interpreters = []string{
 	"python",
 }
 
+type Config struct {
+	Verbose bool
+	Dbfile  string
+}
+
 type CommandInfo struct {
 	Cmd       string
 	CmdKey    string
@@ -79,7 +84,7 @@ func makeCmdKey(args []string) string {
 }
 
 func makeDbKey(cmdInfo CommandInfo) []byte {
-	key := fmt.Sprintf("%v %s", cmdInfo.Start, cmdInfo.CmdKey)
+	key := fmt.Sprintf("%v %s", cmdInfo.Start.Format(dbTimeFormat), cmdInfo.CmdKey)
 	return []byte(key)
 }
 
@@ -88,8 +93,26 @@ func makeDbValue(cmdInfo CommandInfo) ([]byte, error) {
 	return b, err
 }
 
-func recoverDbKey(b []byte) string {
-	return string(b)
+const dbTimeFormat = "2006-01-02 15:04:05.999"
+const dbLenTime = len(dbTimeFormat)
+
+func recoverDbKey(b []byte) (time.Time, string) {
+	keyString := string(b)
+	cmdIdx := dbLenTime + 1
+	// it seems impossible to force trailing zeros in the time storage format.
+	// the shortest should be "2006-01-02 15:04:05.0", though
+	t, err := time.Parse(dbTimeFormat, keyString[:dbLenTime])
+	if err != nil {
+		t, err = time.Parse(dbTimeFormat, keyString[:dbLenTime-1])
+		cmdIdx = dbLenTime
+	}
+	if err != nil {
+		t, err = time.Parse(dbTimeFormat, keyString[:dbLenTime-2])
+		cmdIdx = dbLenTime - 1
+	}
+	check(err)
+	cmd := keyString[cmdIdx:]
+	return t, cmd
 }
 
 func recoverDbValue(b []byte) (CommandInfo, error) {
@@ -98,8 +121,8 @@ func recoverDbValue(b []byte) (CommandInfo, error) {
 	return c, err
 }
 
-func storeCmd(dbfile string, cmdInfo CommandInfo) (err error) {
-	db, err := leveldb.OpenFile(dbfile, nil)
+func storeCmd(config Config, cmdInfo CommandInfo) (err error) {
+	db, err := leveldb.OpenFile(config.Dbfile, nil)
 	if err != nil {
 		return
 	}
@@ -115,8 +138,8 @@ func storeCmd(dbfile string, cmdInfo CommandInfo) (err error) {
 	return
 }
 
-func printDb(dbfile string) (err error) {
-	db, err := leveldb.OpenFile(dbfile, nil)
+func printDb(config Config) (err error) {
+	db, err := leveldb.OpenFile(config.Dbfile, nil)
 	if err != nil {
 		return
 	}
@@ -124,12 +147,12 @@ func printDb(dbfile string) (err error) {
 
 	iter := db.NewIterator(nil, nil)
 	for iter.Next() {
-		key := recoverDbKey(iter.Key())
-		_ = key
+		start, cmd := recoverDbKey(iter.Key())
+		_, _ = start, cmd
 		cmdInfo, err := recoverDbValue(iter.Value())
 		_ = err
-		fmt.Printf("%s\t%s\t= %s\n", cmdInfo.Start.In(time.Local).Format("2006-01-02 15:04:05"),
-			cmdInfo.Cmd, parseDuration(cmdInfo))
+		fmt.Printf("%s\t%s\t= %s\n", start.In(time.Local).Format("2006-01-02 15:04:05"),
+			cmd, parseDuration(cmdInfo))
 	}
 	iter.Release()
 	err = iter.Error()
@@ -158,13 +181,12 @@ func parseTime(arg string) (time.Time, error) {
 	return time.Time{}, err
 }
 
-func parseStartEnd(args []string) (time.Time, time.Time) {
-	const format = "2.1.2006_15:04:05"
+func parseStartEnd(args []string) (time.Time, time.Time, int) {
 	start := time.Time{}
 	end := time.Now()
 	var startErr error
 	var endErr error
-	for _, arg := range args {
+	for i, arg := range args {
 		ts := strings.SplitN(arg, "-", 2)
 		if len(ts) == 2 {
 			end, endErr = parseTime(ts[1])
@@ -173,39 +195,41 @@ func parseStartEnd(args []string) (time.Time, time.Time) {
 				if endErr != nil {
 					end = time.Now()
 				}
-				return start, end
+				return start, end, i
 			}
 		}
 		// a single time is interpreted as single day
 		start, startErr = parseTime(arg)
 		if startErr == nil {
 			end = start.Add(24 * time.Hour)
-			return start, end
+			return start, end, i
 		}
 	}
-	return start, end
+	return start, end, 0
 }
 
-func searchDb(dbfile string, args []string) (err error) {
-	db, err := leveldb.OpenFile(dbfile, nil)
+func searchDb(config Config, args []string) (err error) {
+	db, err := leveldb.OpenFile(config.Dbfile, nil)
 	if err != nil {
 		return
 	}
 	defer db.Close()
 
-	start, end := parseStartEnd(args)
+	start, end, timeIdx := parseStartEnd(args)
+	keywords := args[timeIdx+1:]
+	_ = keywords
 
 	lowerBound := []byte(start.UTC().String())
 	upperBound := []byte(end.UTC().String())
 
 	iter := db.NewIterator(&util.Range{Start: lowerBound, Limit: upperBound}, nil)
 	for iter.Next() {
-		key := recoverDbKey(iter.Key())
-		_ = key
+		start, cmd := recoverDbKey(iter.Key())
+		_, _ = start, cmd
 		cmdInfo, err := recoverDbValue(iter.Value())
 		_ = err
-		fmt.Printf("%s\t%s\t= %s\n", cmdInfo.Start.In(time.Local).Format("2006-01-02 15:04:05"),
-			cmdInfo.Cmd, parseDuration(cmdInfo))
+		fmt.Printf("%s\t%s\t= %s\n", start.In(time.Local).Format("2006-01-02 15:04:05"),
+			cmd, parseDuration(cmdInfo))
 	}
 	iter.Release()
 	err = iter.Error()
@@ -213,7 +237,7 @@ func searchDb(dbfile string, args []string) (err error) {
 	return
 }
 
-func run(args []string) (CommandInfo, error) {
+func run(config Config, args []string) (CommandInfo, error) {
 	cmdInfo := CommandInfo{}
 	cmdInfo.CmdKey = makeCmdKey(args)
 	cmdInfo.Cmd = strings.Join(args, " ")
@@ -235,6 +259,11 @@ func run(args []string) (CommandInfo, error) {
 			cmdInfo.ExitCode = status.ExitStatus()
 		}
 	}
+
+	if config.Verbose {
+		fmt.Printf("cmd: %s\nstart time: %v\nduration: %v\n", cmdInfo.Cmd, cmdInfo.Start.Format("2006-01-02 15:04:05.999 -0700 MST"), cmdInfo.Wall)
+	}
+
 	return cmdInfo, err
 }
 
@@ -251,38 +280,42 @@ func main() {
 	search := flag.Bool("search", false, "search in the database")
 	flag.Parse()
 
+	config := Config{
+		Verbose: *verbose,
+		Dbfile:  *dbFile,
+	}
 	cmdArgs := flag.Args()
-	dbfile := *dbFile
+	// dbfile := *dbFile
 
 	if *printVersion {
 		fmt.Printf("%s\n", version)
 		return
 	}
 
-	if *verbose {
+	if config.Verbose {
 		fmt.Printf("version = %s\n", version)
-		fmt.Printf("dbfile = %s\n", dbfile)
+		fmt.Printf("dbfile = %s\n", config.Dbfile)
 	}
 
 	if *dump {
-		printDb(dbfile)
+		printDb(config)
 		return
 	}
 	if *search {
-		searchDb(dbfile, cmdArgs)
+		searchDb(config, cmdArgs)
 		return
 	}
 	if len(cmdArgs) == 0 {
 		fmt.Println("No command to measure given. Exiting ...")
 		return
 	}
-	cmdInfo, err := run(cmdArgs)
+	cmdInfo, err := run(config, cmdArgs)
 	if err != nil {
 		fmt.Println(err)
 	}
 	printDuration(cmdInfo)
 
-	err = storeCmd(dbfile, cmdInfo)
+	err = storeCmd(config, cmdInfo)
 	check(err)
 
 	// byteKey := database.makeDbKey(cmdInfo)
