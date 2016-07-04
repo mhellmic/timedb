@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"path"
 	"regexp"
@@ -390,6 +391,7 @@ func run(config Config, args []string) (CommandInfo, error) {
 	start := time.Now()
 	err := cmd.Start()
 	check(err)
+	signal.Ignore(syscall.SIGHUP, syscall.SIGINT)
 	err = cmd.Wait()
 	cmdInfo.Wall = time.Since(start)
 	cmdInfo.User = cmd.ProcessState.UserTime()
