@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -18,6 +19,15 @@ import (
 )
 
 const version string = "v0.0.1"
+
+// errorString is a trivial implementation of error.
+type errorString struct {
+	s string
+}
+
+func (e *errorString) Error() string {
+	return e.s
+}
 
 func check(e error) {
 	if e != nil {
@@ -32,6 +42,18 @@ var interpreters = []string{
 type Config struct {
 	Verbose bool
 	Dbfile  string
+}
+
+type RusageKeyword struct {
+	Name     string
+	Relation int
+	Value    int
+}
+
+type DurationKeyword struct {
+	Name     string
+	Relation int
+	Value    time.Duration
 }
 
 type CommandInfo struct {
@@ -182,29 +204,33 @@ func parseTime(arg string) (time.Time, error) {
 	return time.Time{}, err
 }
 
-func parseStartEnd(args []string) (time.Time, time.Time, int) {
+func parseStartEnd(args []string) (time.Time, time.Time, error) {
 	start := time.Time{}
 	end := time.Now()
-	for i, arg := range args {
-		ts := strings.SplitN(arg, "-", 2)
-		if len(ts) == 2 {
-			end, endErr := parseTime(ts[1])
-			start, startErr := parseTime(ts[0])
-			if startErr == nil || endErr == nil {
-				if endErr != nil {
-					end = time.Now()
-				}
-				return start, end, i
+
+	if len(args) == 0 {
+		return start, end, &errorString{s: "not arguments available"}
+	}
+	arg := args[0]
+	ts := strings.SplitN(arg, "-", 2)
+	if len(ts) == 2 {
+		end, endErr := parseTime(ts[1])
+		start, startErr := parseTime(ts[0])
+		if startErr == nil || endErr == nil {
+			if endErr != nil {
+				end = time.Now()
 			}
-		}
-		// a single time is interpreted as single day
-		start, startErr := parseTime(arg)
-		if startErr == nil {
-			end = start.Add(24 * time.Hour)
-			return start, end, i
+			return start, end, nil
 		}
 	}
-	return start, end, -1
+	// a single time is interpreted as single day
+	start, startErr := parseTime(arg)
+	if startErr == nil {
+		end = start.Add(24 * time.Hour)
+		return start, end, nil
+	}
+
+	return start, end, startErr
 }
 
 func findInCmdKey(cmd string, keywords []string) bool {
@@ -217,6 +243,97 @@ func findInCmdKey(cmd string, keywords []string) bool {
 	return allFound
 }
 
+func parseKeywordRelation(arg string) (int, error) {
+	switch {
+	case strings.Contains(arg, "<"):
+		return -1, nil
+	case strings.Contains(arg, "="):
+		return 0, nil
+	case strings.Contains(arg, ">"):
+		return +1, nil
+	}
+	return 0, &errorString{s: "no relation found"}
+}
+
+var durationKwNames = []string{
+	"Walltime", "Systemtime", "Usertime",
+}
+
+func isIn(s string, names []string) bool {
+	for _, n := range names {
+		if s == n {
+			return true
+		}
+	}
+	return false
+}
+
+func parseKeyword(arg string) (DurationKeyword, error) {
+	var dKw DurationKeyword
+	kwRegexp := regexp.MustCompile(">|<|=")
+	s := kwRegexp.Split(arg, -1)
+	if len(s) == 2 {
+		kw := s[0]
+		value := s[1]
+		if isIn(kw, durationKwNames) {
+			d, err := time.ParseDuration(value)
+			if err != nil {
+				return dKw, &errorString{s: "no keyword found"}
+			}
+			r, err := parseKeywordRelation(arg)
+			check(err)
+			dKw = DurationKeyword{Name: kw, Relation: r, Value: d}
+			return dKw, nil
+		}
+	}
+	return dKw, &errorString{s: "no keyword found"}
+}
+
+func findSpecialKeywords(args []string) ([]DurationKeyword, []string) {
+	durationKeywords := make([]DurationKeyword, 0)
+	remainingKeywords := make([]string, 0)
+
+	for _, arg := range args {
+		kw, err := parseKeyword(arg)
+		if err != nil {
+			remainingKeywords = append(remainingKeywords, arg)
+		} else {
+			durationKeywords = append(durationKeywords, kw)
+		}
+	}
+
+	return durationKeywords, remainingKeywords
+}
+
+func findInCmdInfo(cmdInfo CommandInfo, durationKeywords []DurationKeyword) bool {
+	var comp time.Duration
+	for _, kw := range durationKeywords {
+		switch kw.Name {
+		case "Walltime":
+			comp = cmdInfo.Wall
+		case "Usertime":
+			comp = cmdInfo.User
+		case "Systemtime":
+			comp = cmdInfo.System
+		}
+		switch {
+		case kw.Relation < 0:
+			if comp > kw.Value {
+				return false
+			}
+		case kw.Relation == 0:
+			if comp != kw.Value {
+				return false
+			}
+		case kw.Relation > 0:
+			if comp < kw.Value {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func searchDb(config Config, args []string) (err error) {
 	db, err := leveldb.OpenFile(config.Dbfile, nil)
 	if err != nil {
@@ -224,16 +341,20 @@ func searchDb(config Config, args []string) (err error) {
 	}
 	defer db.Close()
 
-	start, end, timeIdx := parseStartEnd(args)
+	start, end, err := parseStartEnd(args)
 	var keywords []string
-	if len(args) == 0 || timeIdx < 0 {
+	if len(args) == 0 || err != nil {
 		keywords = args
 	} else {
-		keywords = args[timeIdx+1:]
+		keywords = args[1:]
 	}
+	durationKeywords, keywords := findSpecialKeywords(keywords)
+
 	if config.Verbose {
 		fmt.Printf("search min: %v\nsearch max: %v\n", start, end)
 		fmt.Printf("keywords: %d %v\n", len(keywords), keywords)
+		// fmt.Printf("rusage keywords: %d %v\n", len(rusageKw), rusageKw)
+		fmt.Printf("time keywords: %d %v\n", len(durationKeywords), durationKeywords)
 	}
 
 	lowerBound := []byte(start.UTC().String())
@@ -246,8 +367,10 @@ func searchDb(config Config, args []string) (err error) {
 		if findInCmdKey(cmd, keywords) {
 			cmdInfo, err := recoverDbValue(iter.Value())
 			check(err)
-			fmt.Printf("%s\t%s\t= %s\n", start.In(time.Local).Format("2006-01-02 15:04:05"),
-				cmd, parseDuration(cmdInfo))
+			if findInCmdInfo(cmdInfo, durationKeywords) {
+				fmt.Printf("%s\t%s\t= %s\n", start.In(time.Local).Format("2006-01-02 15:04:05"),
+					cmd, parseDuration(cmdInfo))
+			}
 		}
 	}
 	iter.Release()
@@ -296,7 +419,7 @@ func main() {
 	verbose := flag.Bool("verbose", false, "print info about timedb")
 	dbFile := flag.String("dbfile", defaultDb, "specify which time database to use")
 	dump := flag.Bool("dump", false, "print the whole database")
-	search := flag.Bool("search", false, "search in the database")
+	search := flag.Bool("search", false, "search in the database. use -search <timerange> <keywords>*")
 	flag.Parse()
 
 	config := Config{
