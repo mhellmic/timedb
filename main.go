@@ -9,6 +9,7 @@ import (
 	"os/user"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -45,16 +46,69 @@ type Config struct {
 	Dbfile  string
 }
 
-type RusageKeyword struct {
+type Keyword interface {
+	GetName() string
+	Matches(interface{}) bool
+}
+
+type IntKeyword struct {
 	Name     string
 	Relation int
 	Value    int
+}
+
+func (kw IntKeyword) GetName() string {
+	return kw.Name
+}
+
+func (kw IntKeyword) Matches(arg interface{}) bool {
+	val := kw.Value
+	comp := arg.(int)
+	switch {
+	case kw.Relation < 0:
+		if comp >= val {
+			return false
+		}
+	case kw.Relation == 0:
+		if comp != val {
+			return false
+		}
+	case kw.Relation > 0:
+		if comp <= val {
+			return false
+		}
+	}
+	return true
 }
 
 type DurationKeyword struct {
 	Name     string
 	Relation int
 	Value    time.Duration
+}
+
+func (kw DurationKeyword) GetName() string {
+	return kw.Name
+}
+
+func (kw DurationKeyword) Matches(arg interface{}) bool {
+	val := kw.Value
+	comp := arg.(time.Duration)
+	switch {
+	case kw.Relation < 0:
+		if comp >= val {
+			return false
+		}
+	case kw.Relation == 0:
+		if comp != val {
+			return false
+		}
+	case kw.Relation > 0:
+		if comp <= val {
+			return false
+		}
+	}
+	return true
 }
 
 type CommandInfo struct {
@@ -260,6 +314,10 @@ var durationKwNames = []string{
 	"Walltime", "Systemtime", "Usertime",
 }
 
+var intKwNames = []string{
+	"Exitcode",
+}
+
 func isIn(s string, names []string) bool {
 	for _, n := range names {
 		if s == n {
@@ -269,67 +327,68 @@ func isIn(s string, names []string) bool {
 	return false
 }
 
-func parseKeyword(arg string) (DurationKeyword, error) {
-	var dKw DurationKeyword
+func parseKeyword(arg string) (Keyword, error) {
+	var iKw Keyword
 	kwRegexp := regexp.MustCompile(">|<|=")
 	s := kwRegexp.Split(arg, -1)
 	if len(s) == 2 {
 		kw := s[0]
 		value := s[1]
-		if isIn(kw, durationKwNames) {
+		switch {
+		case isIn(kw, durationKwNames):
 			d, err := time.ParseDuration(value)
 			if err != nil {
-				return dKw, &errorString{s: "no keyword found"}
+				return iKw, &errorString{s: "parsing duration failed"}
 			}
 			r, err := parseKeywordRelation(arg)
 			check(err)
-			dKw = DurationKeyword{Name: kw, Relation: r, Value: d}
-			return dKw, nil
+			iKw = DurationKeyword{Name: kw, Relation: r, Value: d}
+			return iKw, nil
+		case isIn(kw, intKwNames):
+			i, err := strconv.Atoi(value)
+			if err != nil {
+				return iKw, &errorString{s: "parsing integer failed"}
+			}
+			r, err := parseKeywordRelation(arg)
+			check(err)
+			iKw = IntKeyword{Name: kw, Relation: r, Value: i}
+			return iKw, nil
 		}
 	}
-	return dKw, &errorString{s: "no keyword found"}
+	return iKw, &errorString{s: "no keyword found"}
 }
 
-func findSpecialKeywords(args []string) ([]DurationKeyword, []string) {
-	durationKeywords := make([]DurationKeyword, 0)
-	remainingKeywords := make([]string, 0)
+func findSpecialKeywords(args []string) ([]Keyword, []string) {
+	keywords := make([]Keyword, 0)
+	remaining := make([]string, 0)
 
 	for _, arg := range args {
 		kw, err := parseKeyword(arg)
 		if err != nil {
-			remainingKeywords = append(remainingKeywords, arg)
+			remaining = append(remaining, arg)
 		} else {
-			durationKeywords = append(durationKeywords, kw)
+			keywords = append(keywords, kw)
 		}
 	}
 
-	return durationKeywords, remainingKeywords
+	return keywords, remaining
 }
 
-func findInCmdInfo(cmdInfo CommandInfo, durationKeywords []DurationKeyword) bool {
-	var comp time.Duration
-	for _, kw := range durationKeywords {
-		switch kw.Name {
+func findInCmdInfo(cmdInfo CommandInfo, keywords []Keyword) bool {
+	var comp interface{}
+	for _, kw := range keywords {
+		switch kw.GetName() {
 		case "Walltime":
 			comp = cmdInfo.Wall
 		case "Usertime":
 			comp = cmdInfo.User
 		case "Systemtime":
 			comp = cmdInfo.System
+		case "Exitcode":
+			comp = cmdInfo.ExitCode
 		}
-		switch {
-		case kw.Relation < 0:
-			if comp > kw.Value {
-				return false
-			}
-		case kw.Relation == 0:
-			if comp != kw.Value {
-				return false
-			}
-		case kw.Relation > 0:
-			if comp < kw.Value {
-				return false
-			}
+		if !kw.Matches(comp) {
+			return false
 		}
 	}
 	return true
@@ -349,13 +408,12 @@ func searchDb(config Config, args []string) (err error) {
 	} else {
 		keywords = args[1:]
 	}
-	durationKeywords, keywords := findSpecialKeywords(keywords)
+	specialKeywords, keywords := findSpecialKeywords(keywords)
 
 	if config.Verbose {
 		fmt.Printf("search min: %v\nsearch max: %v\n", start, end)
 		fmt.Printf("keywords: %d %v\n", len(keywords), keywords)
-		// fmt.Printf("rusage keywords: %d %v\n", len(rusageKw), rusageKw)
-		fmt.Printf("time keywords: %d %v\n", len(durationKeywords), durationKeywords)
+		fmt.Printf("special keywords: %d %v\n", len(specialKeywords), specialKeywords)
 	}
 
 	lowerBound := []byte(start.UTC().String())
@@ -368,7 +426,7 @@ func searchDb(config Config, args []string) (err error) {
 		if findInCmdKey(cmd, keywords) {
 			cmdInfo, err := recoverDbValue(iter.Value())
 			check(err)
-			if findInCmdInfo(cmdInfo, durationKeywords) {
+			if findInCmdInfo(cmdInfo, specialKeywords) {
 				fmt.Printf("%s\t%s\t= %s\n", start.In(time.Local).Format("2006-01-02 15:04:05"),
 					cmd, parseDuration(cmdInfo))
 			}
