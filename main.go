@@ -20,7 +20,50 @@ import (
 	"gopkg.in/vmihailenco/msgpack.v2"
 )
 
-const version string = "v0.0.1"
+var currentUser *user.User
+
+const version string = "v1.0.0"
+
+const kwHelpText string = `Normal Keywords:
+Find keyword in the command string.
+Examples:
+	timedb -search python
+	timedb -search '-f 48'
+	timedb -search /home/user ls
+
+Timerange Keywords:
+Find only during the specified time range <start>-<end>.
+One of start or end can be omitted, allowed time formats are
+	d.m.y, d.m.y_hh:mm, hh:mm (read as 'today' at this time)
+If only a single time is given, the search is limited to the
+following 24h period
+Examples:
+	timedb -search 2.1.2006-
+	timedb -search 3.12.1998-4.12.1999_12:43
+	timedb -search -- -1.1.2008
+	timedb -search 10.10.1995
+
+Special Keywords (form <keyword>(<|=|>)value):
+Find commands that satisfy certain runtime criteria.
+Allowed keywords are:
+	Walltime	<duration>		'Walltime>10s'
+	Usertime	<duration>		'Usertime<2m10s'
+	Systemtime	<duration>
+	Exitcode	<number>		'Exitcode=1'
+	Signals		<number>
+
+Combined example:
+	timedb -search 2.1.2015- python 'Walltime>30s' 'Exitcode=0'
+`
+
+type ParseError struct {
+	toParse string
+	as      string
+}
+
+func (s ParseError) Error() string {
+	return fmt.Sprintf("parse: could not parse %s as %s", s.toParse, s.as)
+}
 
 // errorString is a trivial implementation of error.
 type errorString struct {
@@ -31,15 +74,11 @@ func (e *errorString) Error() string {
 	return e.s
 }
 
-func check(e error) {
-	if e != nil {
-		panic(e)
-	}
-}
-
-var interpreters = []string{
-	"python",
-}
+// func check(e error) {
+// 	if e != nil {
+// 		panic(e)
+// 	}
+// }
 
 type Config struct {
 	Verbose bool
@@ -173,7 +212,7 @@ func makeDbValue(cmdInfo CommandInfo) ([]byte, error) {
 const dbTimeFormat = "2006-01-02 15:04:05.999"
 const dbLenTime = len(dbTimeFormat)
 
-func recoverDbKey(b []byte) (time.Time, string) {
+func recoverDbKey(b []byte) (time.Time, string, error) {
 	keyString := string(b)
 	cmdIdx := dbLenTime + 1
 	// it seems impossible to force trailing zeros in the time storage format.
@@ -187,9 +226,11 @@ func recoverDbKey(b []byte) (time.Time, string) {
 		t, err = time.Parse(dbTimeFormat, keyString[:dbLenTime-2])
 		cmdIdx = dbLenTime - 1
 	}
-	check(err)
+	if err != nil {
+		return t, "", err
+	}
 	cmd := keyString[cmdIdx:]
-	return t, cmd
+	return t, cmd, nil
 }
 
 func recoverDbValue(b []byte) (CommandInfo, error) {
@@ -224,10 +265,17 @@ func printDb(config Config) (err error) {
 
 	iter := db.NewIterator(nil, nil)
 	for iter.Next() {
-		start, cmd := recoverDbKey(iter.Key())
-		_, _ = start, cmd
+		start, cmd, err := recoverDbKey(iter.Key())
+		if err != nil {
+			fmt.Printf("WARNING: %s, skipping entry\n", err)
+			continue
+		}
+		_ = cmd
 		cmdInfo, err := recoverDbValue(iter.Value())
-		_ = err
+		if err != nil {
+			fmt.Printf("WARNING: %s, skipping entry\n", err)
+			continue
+		}
 		fmt.Printf("%s\t%s\t= %s\n", start.In(time.Local).Format("2006-01-02 15:04:05"),
 			cmd, parseDuration(cmdInfo))
 	}
@@ -264,7 +312,7 @@ func parseStartEnd(args []string) (time.Time, time.Time, error) {
 	end := time.Now()
 
 	if len(args) == 0 {
-		return start, end, &errorString{s: "not arguments available"}
+		return start, end, &errorString{s: "no arguments available"}
 	}
 	arg := args[0]
 	ts := strings.SplitN(arg, "-", 2)
@@ -307,7 +355,7 @@ func parseKeywordRelation(arg string) (int, error) {
 	case strings.Contains(arg, ">"):
 		return +1, nil
 	}
-	return 0, &errorString{s: "no relation found"}
+	return 0, ParseError{toParse: arg, as: "(<|=|>)"}
 }
 
 var durationKwNames = []string{
@@ -315,7 +363,7 @@ var durationKwNames = []string{
 }
 
 var intKwNames = []string{
-	"Exitcode",
+	"Exitcode", "Signals",
 }
 
 func isIn(s string, names []string) bool {
@@ -338,19 +386,23 @@ func parseKeyword(arg string) (Keyword, error) {
 		case isIn(kw, durationKwNames):
 			d, err := time.ParseDuration(value)
 			if err != nil {
-				return iKw, &errorString{s: "parsing duration failed"}
+				return iKw, ParseError{toParse: value, as: "time.Duration"}
 			}
 			r, err := parseKeywordRelation(arg)
-			check(err)
+			if err != nil {
+				return iKw, err
+			}
 			iKw = DurationKeyword{Name: kw, Relation: r, Value: d}
 			return iKw, nil
 		case isIn(kw, intKwNames):
 			i, err := strconv.Atoi(value)
 			if err != nil {
-				return iKw, &errorString{s: "parsing integer failed"}
+				return iKw, ParseError{toParse: value, as: "int"}
 			}
 			r, err := parseKeywordRelation(arg)
-			check(err)
+			if err != nil {
+				return iKw, err
+			}
 			iKw = IntKeyword{Name: kw, Relation: r, Value: i}
 			return iKw, nil
 		}
@@ -365,6 +417,9 @@ func findSpecialKeywords(args []string) ([]Keyword, []string) {
 	for _, arg := range args {
 		kw, err := parseKeyword(arg)
 		if err != nil {
+			if parseErr, ok := err.(ParseError); ok {
+				fmt.Printf("WARNING: %s\n", parseErr)
+			}
 			remaining = append(remaining, arg)
 		} else {
 			keywords = append(keywords, kw)
@@ -386,6 +441,10 @@ func findInCmdInfo(cmdInfo CommandInfo, keywords []Keyword) bool {
 			comp = cmdInfo.System
 		case "Exitcode":
 			comp = cmdInfo.ExitCode
+		case "Signals":
+			comp = int(cmdInfo.Resources.Nsignals)
+		default:
+			continue
 		}
 		if !kw.Matches(comp) {
 			return false
@@ -402,8 +461,11 @@ func searchDb(config Config, args []string) (err error) {
 	defer db.Close()
 
 	start, end, err := parseStartEnd(args)
+	if start.After(end) {
+		fmt.Println("WARNING: start date is larger than end date")
+	}
 	var keywords []string
-	if len(args) == 0 || err != nil {
+	if err != nil {
 		keywords = args
 	} else {
 		keywords = args[1:]
@@ -421,11 +483,18 @@ func searchDb(config Config, args []string) (err error) {
 
 	iter := db.NewIterator(&util.Range{Start: lowerBound, Limit: upperBound}, nil)
 	for iter.Next() {
-		start, cmd := recoverDbKey(iter.Key())
+		start, cmd, err := recoverDbKey(iter.Key())
+		if err != nil {
+			fmt.Printf("WARNING: %s, skipping entry\n", err)
+			continue
+		}
 		_ = start
 		if findInCmdKey(cmd, keywords) {
 			cmdInfo, err := recoverDbValue(iter.Value())
-			check(err)
+			if err != nil {
+				fmt.Printf("WARNING: %s, skipping entry\n", err)
+				continue
+			}
 			if findInCmdInfo(cmdInfo, specialKeywords) {
 				fmt.Printf("%s\t%s\t= %s\n", start.In(time.Local).Format("2006-01-02 15:04:05"),
 					cmd, parseDuration(cmdInfo))
@@ -448,7 +517,9 @@ func run(config Config, args []string) (CommandInfo, error) {
 	cmd.Stderr = os.Stderr
 	start := time.Now()
 	err := cmd.Start()
-	check(err)
+	if err != nil {
+		return CommandInfo{}, err
+	}
 	signal.Ignore(syscall.SIGHUP, syscall.SIGINT)
 	err = cmd.Wait()
 	cmdInfo.Wall = time.Since(start)
@@ -469,17 +540,24 @@ func run(config Config, args []string) (CommandInfo, error) {
 	return cmdInfo, err
 }
 
-func main() {
-	user, err := user.Current()
-	check(err)
+func init() {
+	var err error
+	currentUser, err = user.Current()
+	if err != nil {
+		fmt.Printf("ERROR: %s\n", err)
+		os.Exit(1)
+	}
+}
 
-	defaultDb := path.Join(user.HomeDir, ".timedatabase")
+func main() {
+	defaultDb := path.Join(currentUser.HomeDir, ".timedatabase")
 
 	printVersion := flag.Bool("version", false, "print version and exit")
-	verbose := flag.Bool("verbose", false, "print info about timedb")
+	verbose := flag.Bool("verbose", false, "print additional info during run")
 	dbFile := flag.String("dbfile", defaultDb, "specify which time database to use")
 	dump := flag.Bool("dump", false, "print the whole database")
 	search := flag.Bool("search", false, "search in the database. use -search <timerange> <keywords>*")
+	kwHelp := flag.Bool("keywordhelp", false, "print help about search keywords and exit")
 	flag.Parse()
 
 	config := Config{
@@ -487,10 +565,14 @@ func main() {
 		Dbfile:  *dbFile,
 	}
 	cmdArgs := flag.Args()
-	// dbfile := *dbFile
 
 	if *printVersion {
 		fmt.Printf("%s\n", version)
+		return
+	}
+
+	if *kwHelp {
+		fmt.Println(kwHelpText)
 		return
 	}
 
@@ -500,11 +582,19 @@ func main() {
 	}
 
 	if *dump {
-		printDb(config)
+		err := printDb(config)
+		if err != nil {
+			fmt.Printf("ERROR: %s", err)
+			os.Exit(1)
+		}
 		return
 	}
 	if *search {
-		searchDb(config, cmdArgs)
+		err := searchDb(config, cmdArgs)
+		if err != nil {
+			fmt.Printf("ERROR: %s", err)
+			os.Exit(1)
+		}
 		return
 	}
 	if len(cmdArgs) == 0 {
@@ -513,17 +603,14 @@ func main() {
 	}
 	cmdInfo, err := run(config, cmdArgs)
 	if err != nil {
-		fmt.Println(err)
+		fmt.Printf("ERROR: %s", err)
+		os.Exit(1)
 	}
 	printDuration(cmdInfo)
 
 	err = storeCmd(config, cmdInfo)
-	check(err)
-
-	// byteKey := database.makeDbKey(cmdInfo)
-	// byteValue := database.makeDbValue(cmdInfo)
-
-	// check(err)
-	// fmt.Println(cmdInfo)
-	// fmt.Println(c2)
+	if err != nil {
+		fmt.Printf("ERROR: %s", err)
+		os.Exit(1)
+	}
 }
