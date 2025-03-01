@@ -45,8 +45,7 @@ const licenseHelp string = `
     timedb  Copyright (C) 2016  Martin Hellmich (mhellmic@gmail.com)
     This program comes with ABSOLUTELY NO WARRANTY.
     This is free software, and you are welcome to redistribute it
-    under certain conditions.
-`
+    under certain conditions.`
 
 const kwHelpText string = `Normal Keywords:
 Find keyword in the command string.
@@ -77,8 +76,7 @@ Allowed keywords are:
 	Signals		<number>
 
 Combined example:
-	timedb -search 2.1.2015- python 'Walltime>30s' 'Exitcode=0'
-`
+	timedb -search 2.1.2015- python 'Walltime>30s' 'Exitcode=0'`
 
 type ParseError struct {
 	toParse string
